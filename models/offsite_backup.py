@@ -1,9 +1,15 @@
+import glob
+import gzip
+import hashlib
 import json
 import logging
 import os
+import platform
+import re
 import shutil
 import subprocess
 import tempfile
+import urllib.request
 import zipfile
 from datetime import datetime, timezone
 
@@ -21,7 +27,35 @@ except ImportError:  # pragma: no cover
     boto3 = None
 
 PARAM_TARGETS = "offsite_backup.targets"
+PARAM_PG_BIN = "offsite_backup.pg_bin_dir"  # optional manual override
 CHUNK = 64 * 1024 * 1024  # 64 MB multipart chunks
+PGDG = "https://apt.postgresql.org/pub/repos/apt"
+ARCH = {"x86_64": ("amd64", "x86_64-linux-gnu"), "aarch64": ("arm64", "aarch64-linux-gnu")}
+
+
+def _tool_major(path, env):
+    """Return the major version of a pg tool, or 0 if it can't be run."""
+    try:
+        out = subprocess.run([path, "--version"], env=env, capture_output=True,
+                             text=True, timeout=30).stdout
+    except Exception:
+        return 0
+    m = re.search(r"\(PostgreSQL\)\s+(\d+)", out)
+    return int(m.group(1)) if m else 0
+
+
+def _parse_packages(text, wanted):
+    """Parse a Debian 'Packages' index -> {package: (Filename, SHA256)}."""
+    found = {}
+    for stanza in text.split("\n\n"):
+        fields = {}
+        for line in stanza.splitlines():
+            if ": " in line and not line.startswith(" "):
+                k, v = line.split(": ", 1)
+                fields[k] = v
+        if fields.get("Package") in wanted and "Filename" in fields:
+            found[fields["Package"]] = (fields["Filename"], fields.get("SHA256"))
+    return found
 
 
 class OffsiteBackup(models.AbstractModel):
@@ -51,8 +85,9 @@ class OffsiteBackup(models.AbstractModel):
 
         # pg_dump runs in its own connection with the same PG credentials Odoo
         # uses, so the master password never comes into play.
-        cmd = [find_pg_tool("pg_dump"), "--no-owner", f"--file={sql_path}", db]
-        res = subprocess.run(cmd, env=exec_pg_environ(),
+        pg_dump, env = self._get_pg_dump()
+        cmd = [pg_dump, "--no-owner", f"--file={sql_path}", db]
+        res = subprocess.run(cmd, env=env,
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if res.returncode != 0:
             raise UserError(f"pg_dump failed: {res.stderr.decode(errors='replace')}")
@@ -74,6 +109,100 @@ class OffsiteBackup(models.AbstractModel):
                         zf.write(full, os.path.join("filestore", os.path.relpath(full, filestore)))
         os.remove(sql_path)
         return zip_path
+
+    # ---------------------------------------------------------------- pg_dump
+    @api.model
+    def _get_pg_dump(self):
+        """Find a pg_dump whose major version is >= the server's.
+        Order: manual override param, previously provisioned copy, any
+        /usr/lib/postgresql/*/bin, Odoo's default. If none matches, download
+        the official PGDG client into the data dir (no root needed)."""
+        self.env.cr.execute("SHOW server_version_num")
+        server_major = int(self.env.cr.fetchone()[0]) // 10000
+
+        candidates = []  # (path, libdir or None)
+        override = self.env["ir.config_parameter"].sudo().get_param(PARAM_PG_BIN)
+        if override:
+            candidates.append((os.path.join(override, "pg_dump"), None))
+        cached, libdir = self._provisioned_paths(server_major)
+        candidates.append((cached, libdir))
+        candidates += [(p, None) for p in sorted(glob.glob("/usr/lib/postgresql/*/bin/pg_dump"), reverse=True)]
+        try:
+            candidates.append((find_pg_tool("pg_dump"), None))
+        except Exception:
+            pass
+
+        for path, lib in candidates:
+            if path and os.path.isfile(path):
+                env = self._pg_env(lib)
+                if _tool_major(path, env) >= server_major:
+                    return path, env
+
+        _logger.info("Off-site backup: no pg_dump >= %s found, provisioning one", server_major)
+        self._provision_pg_dump(server_major)
+        env = self._pg_env(libdir)
+        if _tool_major(cached, env) < server_major:
+            raise UserError(f"Provisioned pg_dump at {cached} does not run or is too old.")
+        return cached, env
+
+    @api.model
+    def _pg_env(self, libdir):
+        env = exec_pg_environ()
+        if libdir:
+            env["LD_LIBRARY_PATH"] = libdir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        return env
+
+    @api.model
+    def _provisioned_paths(self, major):
+        multiarch = ARCH.get(platform.machine(), ("amd64", "x86_64-linux-gnu"))[1]
+        root = os.path.join(tools.config["data_dir"], "offsite_backup_pg", str(major), "root")
+        return (os.path.join(root, "usr/lib/postgresql", str(major), "bin/pg_dump"),
+                os.path.join(root, "usr/lib", multiarch))
+
+    @api.model
+    def _provision_pg_dump(self, major):
+        machine = platform.machine()
+        if machine not in ARCH:
+            raise UserError(f"Unsupported CPU architecture for auto-provisioning: {machine}")
+        arch = ARCH[machine][0]
+        codename = ""
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("VERSION_CODENAME="):
+                    codename = line.split("=", 1)[1].strip().strip('"')
+        if not codename:
+            raise UserError("Could not detect the Ubuntu codename from /etc/os-release.")
+
+        base = os.path.dirname(self._provisioned_paths(major)[0].split("/usr/lib/postgresql/")[0])
+        root = os.path.join(base, "root")
+        os.makedirs(base, exist_ok=True)
+        index_url = f"{PGDG}/dists/{codename}-pgdg/main/binary-{arch}/Packages.gz"
+        try:
+            with urllib.request.urlopen(index_url, timeout=120) as r:
+                index = gzip.decompress(r.read()).decode("utf-8", "replace")
+        except Exception as e:
+            raise UserError(
+                f"Could not download {index_url} ({e}). Install a PostgreSQL {major} client "
+                f"manually and set the system parameter {PARAM_PG_BIN} to its bin directory.")
+
+        wanted = {f"postgresql-client-{major}", "libpq5"}
+        pkgs = _parse_packages(index, wanted)
+        missing = wanted - set(pkgs)
+        if missing:
+            raise UserError(f"Packages not found in PGDG index: {', '.join(sorted(missing))}")
+
+        shutil.rmtree(root, ignore_errors=True)
+        for name, (filename, sha256) in pkgs.items():
+            deb = os.path.join(base, os.path.basename(filename))
+            with urllib.request.urlopen(f"{PGDG}/{filename}", timeout=300) as r, open(deb, "wb") as out:
+                shutil.copyfileobj(r, out)
+            if sha256:
+                with open(deb, "rb") as fh:
+                    if hashlib.sha256(fh.read()).hexdigest() != sha256:
+                        raise UserError(f"Checksum mismatch for {filename}")
+            subprocess.run(["dpkg-deb", "-x", deb, root], check=True)
+            os.remove(deb)
+        _logger.info("Off-site backup: provisioned PostgreSQL %s client in %s", major, root)
 
     # ------------------------------------------------------------------ upload
     @api.model
