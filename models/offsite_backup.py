@@ -1,3 +1,4 @@
+import bz2
 import glob
 import gzip
 import hashlib
@@ -214,14 +215,22 @@ class OffsiteBackup(models.AbstractModel):
         os.makedirs(base, exist_ok=True)
         # Remove the copy an earlier version of this module provisioned (too new to work).
         shutil.rmtree(os.path.join(os.path.dirname(base), str(major)), ignore_errors=True)
-        index_url = f"{PGDG_ARCHIVE}/dists/{codename}-pgdg-archive/main/binary-{arch}/Packages.gz"
-        try:
-            with urllib.request.urlopen(index_url, timeout=300) as r:
-                index = gzip.decompress(r.read()).decode("utf-8", "replace")
-        except Exception as e:
+        # The archive publishes Packages.bz2 (no .gz); try the common variants in turn.
+        index_base = f"{PGDG_ARCHIVE}/dists/{codename}-pgdg-archive/main/binary-{arch}/Packages"
+        index, errors = None, []
+        for suffix, decode in ((".bz2", bz2.decompress), (".gz", gzip.decompress), ("", lambda b: b)):
+            index_url = index_base + suffix
+            try:
+                with urllib.request.urlopen(index_url, timeout=300) as r:
+                    index = decode(r.read()).decode("utf-8", "replace")
+                break
+            except Exception as e:
+                errors.append(f"{index_url}: {e}")
+        if index is None:
             raise UserError(
-                f"Could not download {index_url} ({e}). Install a PostgreSQL {major} client "
-                f"manually and set the system parameter {PARAM_PG_BIN} to its bin directory.")
+                "Could not download the PostgreSQL package index (" + "; ".join(errors) + "). "
+                f"Install a PostgreSQL {major} client manually and set the system parameter "
+                f"{PARAM_PG_BIN} to its bin directory.")
 
         stanzas = _parse_packages(index, {f"postgresql-client-{major}", "libpq5"})
         client, lib = _pick_pre_fix(stanzas, major)
