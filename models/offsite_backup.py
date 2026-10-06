@@ -29,7 +29,12 @@ except ImportError:  # pragma: no cover
 PARAM_TARGETS = "offsite_backup.targets"
 PARAM_PG_BIN = "offsite_backup.pg_bin_dir"  # optional manual override
 CHUNK = 64 * 1024 * 1024  # 64 MB multipart chunks
-PGDG = "https://apt.postgresql.org/pub/repos/apt"
+# The archive keeps every version ever published, in DIST-pgdg-archive.
+PGDG_ARCHIVE = "https://apt-archive.postgresql.org/pub/repos/apt"
+# First minor release of each major that includes the CVE-2024-7348 fix.
+# Those releases make pg_dump read pg_settings ("restrict_nonsystem_relation_kind"),
+# which Odoo.sh denies to the tenant role, so we pin to the release just before.
+FIRST_FIXED = {12: (12, 20), 13: (13, 16), 14: (14, 13), 15: (15, 8), 16: (16, 4)}
 ARCH = {"x86_64": ("amd64", "x86_64-linux-gnu"), "aarch64": ("arm64", "aarch64-linux-gnu")}
 
 
@@ -45,17 +50,44 @@ def _tool_major(path, env):
 
 
 def _parse_packages(text, wanted):
-    """Parse a Debian 'Packages' index -> {package: (Filename, SHA256)}."""
-    found = {}
+    """Parse a Debian 'Packages' index -> list of field dicts for wanted packages."""
+    found = []
     for stanza in text.split("\n\n"):
         fields = {}
         for line in stanza.splitlines():
             if ": " in line and not line.startswith(" "):
                 k, v = line.split(": ", 1)
                 fields[k] = v
-        if fields.get("Package") in wanted and "Filename" in fields:
-            found[fields["Package"]] = (fields["Filename"], fields.get("SHA256"))
+        if fields.get("Package") in wanted and "Filename" in fields and "Version" in fields:
+            found.append(fields)
     return found
+
+
+def _upstream(version):
+    """'16.3-1.pgdg22.04+1' -> (16, 3); None for betas/RCs or odd strings."""
+    up = version.split(":")[-1].split("-")[0]
+    if "~" in up:
+        return None
+    try:
+        return tuple(int(p) for p in up.split("."))
+    except ValueError:
+        return None
+
+
+def _pick_pre_fix(stanzas, major):
+    """Newest postgresql-client-<major> older than the CVE-2024-7348 fix,
+    plus the libpq5 of the same upstream version (or the newest libpq5)."""
+    limit = FIRST_FIXED[major]
+    clients = [(v, s) for s in stanzas if s["Package"] == f"postgresql-client-{major}"
+               for v in [_upstream(s["Version"])] if v and v[0] == major and v < limit]
+    if not clients:
+        return None, None
+    cver, client = max(clients, key=lambda x: x[0])
+    libs = [(v, s) for s in stanzas if s["Package"] == "libpq5"
+            for v in [_upstream(s["Version"])] if v]
+    same = [x for x in libs if x[0] == cver]
+    lib = max(same or libs, key=lambda x: x[0])[1] if libs else None
+    return client, lib
 
 
 class OffsiteBackup(models.AbstractModel):
@@ -155,12 +187,16 @@ class OffsiteBackup(models.AbstractModel):
     @api.model
     def _provisioned_paths(self, major):
         multiarch = ARCH.get(platform.machine(), ("amd64", "x86_64-linux-gnu"))[1]
-        root = os.path.join(tools.config["data_dir"], "offsite_backup_pg", str(major), "root")
+        root = os.path.join(tools.config["data_dir"], "offsite_backup_pg", f"{major}-pre7348", "root")
         return (os.path.join(root, "usr/lib/postgresql", str(major), "bin/pg_dump"),
                 os.path.join(root, "usr/lib", multiarch))
 
     @api.model
     def _provision_pg_dump(self, major):
+        if major not in FIRST_FIXED:
+            raise UserError(
+                f"PostgreSQL {major} has no pg_dump release that works without reading "
+                "pg_settings. Ask Odoo support to grant SELECT on pg_settings.")
         machine = platform.machine()
         if machine not in ARCH:
             raise UserError(f"Unsupported CPU architecture for auto-provisioning: {machine}")
@@ -176,25 +212,29 @@ class OffsiteBackup(models.AbstractModel):
         base = os.path.dirname(self._provisioned_paths(major)[0].split("/usr/lib/postgresql/")[0])
         root = os.path.join(base, "root")
         os.makedirs(base, exist_ok=True)
-        index_url = f"{PGDG}/dists/{codename}-pgdg/main/binary-{arch}/Packages.gz"
+        # Remove the copy an earlier version of this module provisioned (too new to work).
+        shutil.rmtree(os.path.join(os.path.dirname(base), str(major)), ignore_errors=True)
+        index_url = f"{PGDG_ARCHIVE}/dists/{codename}-pgdg-archive/main/binary-{arch}/Packages.gz"
         try:
-            with urllib.request.urlopen(index_url, timeout=120) as r:
+            with urllib.request.urlopen(index_url, timeout=300) as r:
                 index = gzip.decompress(r.read()).decode("utf-8", "replace")
         except Exception as e:
             raise UserError(
                 f"Could not download {index_url} ({e}). Install a PostgreSQL {major} client "
                 f"manually and set the system parameter {PARAM_PG_BIN} to its bin directory.")
 
-        wanted = {f"postgresql-client-{major}", "libpq5"}
-        pkgs = _parse_packages(index, wanted)
-        missing = wanted - set(pkgs)
-        if missing:
-            raise UserError(f"Packages not found in PGDG index: {', '.join(sorted(missing))}")
+        stanzas = _parse_packages(index, {f"postgresql-client-{major}", "libpq5"})
+        client, lib = _pick_pre_fix(stanzas, major)
+        if not client or not lib:
+            raise UserError(f"No suitable postgresql-client-{major} / libpq5 found in {index_url}")
+        _logger.info("Off-site backup: using postgresql-client-%s %s, libpq5 %s",
+                     major, client["Version"], lib["Version"])
 
         shutil.rmtree(root, ignore_errors=True)
-        for name, (filename, sha256) in pkgs.items():
+        for pkg in (lib, client):
+            filename, sha256 = pkg["Filename"], pkg.get("SHA256")
             deb = os.path.join(base, os.path.basename(filename))
-            with urllib.request.urlopen(f"{PGDG}/{filename}", timeout=300) as r, open(deb, "wb") as out:
+            with urllib.request.urlopen(f"{PGDG_ARCHIVE}/{filename}", timeout=300) as r, open(deb, "wb") as out:
                 shutil.copyfileobj(r, out)
             if sha256:
                 with open(deb, "rb") as fh:
